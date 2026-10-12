@@ -48,52 +48,55 @@ window.
 ## Building and running
 
 ```bash
-mkdir build && cd build
-cmake .. -DCMAKE_BUILD_TYPE=Release
-make
-cd ..
-./build/tick_pipeline 50000        # run both pipelines on 50k synthetic packets each
-python scripts/plot_latency.py     # needs pandas + matplotlib
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release      # on MSYS2/Windows add: -G "MinGW Makefiles"
+cmake --build build
+./build/tick_pipeline 200000 1000000 5 2 4         # packets, msg/s, trials, producer core, consumer core
+python scripts/plot_latency.py                      # needs pandas + matplotlib
 ```
+
+Or without CMake: `g++ -std=c++20 -O2 -Iinclude src/main.cpp -o tick_pipeline -pthread`.
+
+## How the benchmark is made fair
+
+The first version of this benchmark flattered the lock-free queue: the
+producer sent as fast as it could, the ring buffer was bounded but the mutex
+queue was not, so the mutex numbers (milliseconds) mostly measured how long a
+message sat behind a growing backlog, not the cost of the lock. Now:
+
+- **Both queues have the same bound** (4,095 messages). `MutexQueue::try_push`
+  refuses when full, exactly like `SpscRingBuffer::try_push`.
+- **The producer is paced** to a fixed schedule (default 1M messages/s), so
+  latency is send-to-receive time. Rate `0` gives the old unpaced flood.
+  If the producer cannot keep up with the schedule, the program says so.
+- **Threads are pinned** to two logical CPUs (`SetThreadAffinityMask` on
+  Windows, `pthread_setaffinity_np` on Linux). Use two different physical
+  cores: logical CPUs 2k and 2k+1 are usually hyper-threads of one core.
+- **Five alternating trials** per queue, 10,000 warm-up messages dropped from
+  each, and the report is the median of each percentile across trials
+  (`output/summary.csv` has every trial).
 
 ## Reading the output
 
-`tick_pipeline` prints throughput and a latency percentile table for each
-pipeline, then a tail-latency ratio (mutex / lock-free) at p50/p99/p99.9, and
-writes every raw sample to `output/latencies.csv`.
-`scripts/plot_latency.py` turns that into `output/latency_comparison.png`: a
-percentile bar chart (log-scaled, since tails routinely differ by an order of
-magnitude) and a latency-distribution histogram for both pipelines.
+`tick_pipeline` prints the median p50 / p90 / p99 / p99.9 / max latency per
+queue and the mutex-to-lock-free ratio at p50 / p99 / p99.9.
+`output/latencies.csv` has every sample from the last trial, and
+`scripts/plot_latency.py` turns it into `output/latency_comparison.png`.
 
-The pattern to expect: the lock-free pipeline's p50 should be dramatically
-lower (single-digit microseconds, since there's genuinely nothing to wait
-for), and it should hold its tail (p99/p99.9) far more tightly than the
-mutex-based one, which is prone to occasional long waits whenever the
-producer holds the lock at an inconvenient moment for the consumer.
+Expect the lock-free queue to win clearly at p50 (a hand-off is two atomic
+operations with nothing to wait for). The tails are where machine noise shows
+up: run on mains power, in a high-performance power mode, with other programs
+closed, and check that the five trials agree before quoting a number.
 
 ## Known limitations (say these before you're asked)
 
-- **This was built and benchmarked in a shared, 2-vCPU cloud sandbox with no
-  thread pinning or CPU isolation** -- the absolute latency numbers in this
-  repo's checked-in `output/` are inflated by container scheduling noise
-  (you'll see occasional millisecond-scale outliers on *both* pipelines,
-  which shouldn't happen on a dedicated machine) and are not numbers to put
-  on a resume. **Re-run `./build/tick_pipeline` on your own machine** before
-  quoting a number in an interview -- the relative comparison (lock-free
-  beats mutex on tail latency, consistently) is the real result; the
-  absolute nanosecond figures are not, until you've measured them on
-  hardware you control.
-- No CPU affinity / thread pinning (`pthread_setaffinity_np` or platform
-  equivalent) -- a real low-latency system pins the producer and consumer to
-  isolated cores specifically to get rid of the scheduling noise mentioned
-  above. Worth adding as the first real extension.
+- On Windows, `steady_clock` ticks in 100 ns steps, so latencies are
+  quantised to 100 ns there; Linux gives nanosecond-resolution timestamps.
+- The numbers checked into `output/` come from a shared 2-vCPU cloud sandbox
+  and are not numbers to quote. Re-run on your own machine.
 - The "market data" is synthetic random packets, not a real exchange binary
-  protocol (ITCH, OUCH, FIX/FAST) -- decoding is assumed already done; this
-  project starts one stage downstream of that.
-- Single producer, single consumer only. A real feed handler often needs to
-  fan out to multiple consumers (a strategy thread and a risk thread, say),
-  which is a fundamentally harder lock-free problem (MPMC) than what's
-  implemented here -- see "extensions" below.
+  protocol (ITCH, OUCH, FIX/FAST): decoding is assumed already done.
+- Single producer, single consumer only. Fanning out to several consumers (a
+  strategy thread and a risk thread, say) is the much harder MPMC problem.
 
 ## What to be ready to explain in an interview
 
@@ -120,8 +123,6 @@ producer holds the lock at an inconvenient moment for the consumer.
 
 ## Extensions worth doing if you have more time
 
-- Pin producer and consumer to specific cores and re-measure -- this is the
-  single highest-value fix for getting numbers you can actually defend.
 - Extend to MPMC (multiple feed threads, e.g. one per exchange session) --
   this is where you actually need a CAS retry loop, and where the ABA
   problem becomes real.
